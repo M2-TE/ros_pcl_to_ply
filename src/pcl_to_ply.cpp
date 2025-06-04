@@ -1,4 +1,7 @@
 #include <fstream>
+#include <sstream>
+#include <iomanip>
+
 #include <Eigen/Eigen>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -28,49 +31,97 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(Point,
     (float, time, time)
     (double, timestamp, timestamp))
 
-struct pcl_to_ply: public rclcpp::Node {
-    pcl_to_ply(): Node("pcl_to_ply") {
+class pcl_to_ply: public rclcpp::Node 
+{
+public:   
+    pcl_to_ply(): Node("pcl_to_ply") 
+    {
+
+        _frame_count        = 0;
+        _local_map_size     = 1000;
+        _local_map_points   = 0;
+        _local_map_id       = 0;
+
         _sub_pcl = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "/pointcloud", 
             100,
-            std::bind(&pcl_to_ply::callback_points, this, std::placeholders::_1)
+            std::bind(&pcl_to_ply::callback_frame, this, std::placeholders::_1)
         );
-
-        std::ios::sync_with_stdio(false);
-        _ofs.open("pointcloud.ply", std::ios::binary);
-        _ofs.rdbuf()->pubsetbuf(_io_buffer.data(), _io_buffer.size());
-        _ofs << "ply\n";
-        _ofs << "format ascii 1.0\n";
-        // _ofs << "format binary_little_endian 1.0\n";
-        _ofs << "element vertex                         \n";
-        _ofs << "property float x\n";
-        _ofs << "property float y\n";
-        _ofs << "property float z\n";
-        _ofs << "end_header\n";
-    }
-    ~pcl_to_ply() {
-        // write vertex count
-        _ofs.seekp(36, std::ios::beg);
-        // _ofs.seekp(51, std::ios::beg);
-        _ofs << _point_count;
-        _ofs.close();
     }
 
-    void callback_points(const sensor_msgs::msg::PointCloud2& msg) {
-        // extract pointcloud from message
+private:
+    void callback_frame(const sensor_msgs::msg::PointCloud2& msg) 
+    {
+        RCLCPP_INFO(get_logger(), "Receiving frame %zu from %zu for chunk %zu",  _frame_count, _local_map_size, _local_map_id);
         pcl::PointCloud<Point> pointcloud = {};
         pcl::fromROSMsg(msg, pointcloud);
-        std::cout << "Received " << pointcloud.points.size() << " points" << std::endl;
-        for (const auto& point: pointcloud.points) {
-            _ofs << point.x << ' ' << point.y << ' ' << point.z << '\n';
+        _frame_count++;
+        _local_map_points += pointcloud.points.size();
+        for(const auto& point: pointcloud.points)
+        {
+            _points.push_back(point);
         }
-        _point_count += pointcloud.points.size();
+        if(_frame_count > _local_map_size)
+        {
+            saveLocalMap();
+        }
     }
 
-    std::ofstream _ofs;
-    std::size_t _point_count;
-    std::array<char, 256*1024> _io_buffer;
+    void saveLocalMap()
+    {
+        // Generate file name and output stream for current chunk
+        std::stringstream sstr;
+        sstr << "chunk" << std::setfill('0') << std::setw(5) << _local_map_id << ".ply";
+        std::ofstream out;
+        out.open(sstr.str().c_str(), std::ios::binary);
+
+        RCLCPP_INFO(get_logger(), "Writing chunk %zu to file %s", _local_map_id, sstr.str().c_str());
+
+        // Write PLY header
+        out << "ply" << std::endl;
+        out << "format binary_little_endian 1.0" << std::endl;
+        out << "element vertex " << _local_map_points << std::endl;
+        out << "property float x" << std::endl;
+        out << "property float y" << std::endl;
+        out << "property float z" << std::endl;
+        out << "property float intensity" << std::endl;
+        out << "end_header" << std::endl;
+
+        // Write binary blob with point cloud data (should be buffered in next
+        // version but currently performance seems to be sufficient 
+        for(const auto& point: _points)
+        {
+            out.write(reinterpret_cast<const char *>(&point.x), sizeof(float));
+            out.write(reinterpret_cast<const char *>(&point.y), sizeof(float));
+            out.write(reinterpret_cast<const char *>(&point.z), sizeof(float));
+            out.write(reinterpret_cast<const char *>(&point.intensity), sizeof(float));
+        }
+        
+        // Reset counters
+        _points.clear();
+        _local_map_points = 0;
+        _frame_count = 0;
+        _local_map_id++;
+    }
+
+    /// Subscription to descewed point clouds
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr _sub_pcl;
+
+    /// @brief  Buffer for current local map
+    std::vector<Point> _points;
+
+    /// @brief  Number of frames in current local map
+    size_t _frame_count;
+
+    /// @brief  Number of frames per local map
+    size_t _local_map_size;
+
+    /// @brief  Number of points in current local map
+    size_t _local_map_points;
+
+    /// @brief  Map id (chunk number)
+    size_t _local_map_id;
+    
 };
 
 int main(int argc, char * argv[]) {
